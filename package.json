@@ -1,12 +1,13 @@
 {
   "name": "sentinel-backend",
   "version": "1.0.0",
-  "description": "SENTINEL backend - Express API + Turso storage + AI chat route",
+  "description": "SENTINEL backend - Express API + Turso storage + two-tier AI + analytics/maintenance layer",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@libsql/client": "^0.14.0",

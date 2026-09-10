@@ -29,6 +29,20 @@ app.use(express.json());
 const DEVICE_API_KEY = process.env.DEVICE_API_KEY;
 const DEFAULT_DEVICE_ID = 'sentinel-01';
 
+// Fail loudly at startup rather than silently on the first AI call. This is
+// a WARNING, not a crash: per the "AI never gates core function" rule,
+// status/event ingestion from the ESP32 must keep working even if AI is
+// completely unconfigured - only /api/ai/chat and incident narratives
+// would be affected.
+if (!process.env.AI_API_KEY) {
+  console.error(
+    '[STARTUP] WARNING: AI_API_KEY is not set. The AI chat endpoint and ' +
+    'incident narratives will fail on every call until this is set in ' +
+    '.env (locally) or the Render environment variables (deployed). ' +
+    'ESP32 status/event ingestion is unaffected and will work normally.'
+  );
+}
+
 // Event types worth an AI narrative. Deliberately excludes routine/noisy
 // types like wrong_pin (a single wrong PIN isn't an incident) - it still
 // gets logged and shown instantly either way, just without AI prose.
@@ -39,6 +53,31 @@ const NARRATIVE_EVENT_TYPES = new Set([
   'gas_smoke_danger',
   'possible_fire',
 ]);
+
+// The AI chat route has no auth (it's meant to be hit by a public dashboard),
+// but each call costs real money against the AI provider. A simple in-memory
+// sliding window keeps an open endpoint from turning into an open bill -
+// good enough for a prototype; swap for a shared store (e.g. Redis) if this
+// ever runs on more than one server instance.
+const CHAT_RATE_LIMIT_MAX = 8;
+const CHAT_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const chatRequestLog = new Map(); // ip -> array of request timestamps
+
+function chatRateLimiter(req, res, next) {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const timestamps = (chatRequestLog.get(ip) || []).filter(
+    (t) => now - t < CHAT_RATE_LIMIT_WINDOW_MS
+  );
+
+  if (timestamps.length >= CHAT_RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: 'rate_limited', retryAfterMs: CHAT_RATE_LIMIT_WINDOW_MS });
+  }
+
+  timestamps.push(now);
+  chatRequestLog.set(ip, timestamps);
+  next();
+}
 
 // Protects the two write routes the ESP32 uses. Dashboard reads (GET) and
 // the AI chat route are intentionally left open for the prototype - add
@@ -178,7 +217,7 @@ app.get('/api/maintenance/:deviceId?', async (req, res) => {
   }
 });
 
-app.post('/api/ai/chat', async (req, res) => {
+app.post('/api/ai/chat', chatRateLimiter, async (req, res) => {
   try {
     const { question, deviceId } = req.body || {};
     if (!question || typeof question !== 'string') {
