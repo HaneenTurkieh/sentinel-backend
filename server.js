@@ -1,11 +1,26 @@
 // server.js - SENTINEL backend entry point.
+//
+// CHANGES FROM THE ORIGINAL:
+//  - Every status/event write now also updates analytics.js (Layer 1 -
+//    plain statistics, runs synchronously, no LLM involved).
+//  - Critical events now trigger an async incident narrative (Layer 2b)
+//    AFTER the ESP32 already has its 200 OK - this never adds latency to
+//    the ESP32's request, and a slow/failed AI call can't delay or block
+//    the event from showing up immediately in the dashboard's event feed.
+//  - New GET /api/maintenance/:deviceId (also accepts ?deviceId=) for the
+//    dashboard's maintenance/predictive-maintenance panel.
+//  - /api/ai/chat now also passes the maintenance summary into context.
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-const { initDb, upsertStatus, insertEvent, getStatus, getEvents } = require('./db');
-const { chatWithSentinel } = require('./ai');
+const {
+  initDb, upsertStatus, insertEvent, updateEventSummary,
+  getStatus, getEvents, getEventById,
+} = require('./db');
+const analytics = require('./analytics');
+const { chatWithSentinel, generateIncidentNarrative } = require('./ai');
 
 const app = express();
 app.use(cors());
@@ -13,6 +28,17 @@ app.use(express.json());
 
 const DEVICE_API_KEY = process.env.DEVICE_API_KEY;
 const DEFAULT_DEVICE_ID = 'sentinel-01';
+
+// Event types worth an AI narrative. Deliberately excludes routine/noisy
+// types like wrong_pin (a single wrong PIN isn't an incident) - it still
+// gets logged and shown instantly either way, just without AI prose.
+const NARRATIVE_EVENT_TYPES = new Set([
+  'unauthorized_rfid',
+  'security_lockout',
+  'smoke_warning',
+  'gas_smoke_danger',
+  'possible_fire',
+]);
 
 // Protects the two write routes the ESP32 uses. Dashboard reads (GET) and
 // the AI chat route are intentionally left open for the prototype - add
@@ -29,6 +55,27 @@ function requireDeviceKey(req, res, next) {
   next();
 }
 
+// Fire-and-forget: generates the incident narrative and attaches it to
+// the event row. Called only AFTER the ESP32 already has its response.
+// Any failure here is logged and otherwise invisible to the rest of the
+// system - the event itself is already saved and already visible.
+async function enrichEventWithNarrative(eventId, eventForContext, deviceId) {
+  try {
+    const [recentEvents, maintenance] = await Promise.all([
+      getEvents(deviceId, 10),
+      analytics.buildMaintenanceSummary(deviceId, await getStatus(deviceId)),
+    ]);
+    const narrative = await generateIncidentNarrative({
+      event: eventForContext,
+      recentEvents,
+      maintenance,
+    });
+    await updateEventSummary(eventId, narrative);
+  } catch (err) {
+    console.error('[AI] Failed to generate/store incident narrative for event', eventId, err);
+  }
+}
+
 // --- ESP32 -> backend -------------------------------------------------
 
 app.post('/api/status', requireDeviceKey, async (req, res) => {
@@ -37,6 +84,11 @@ app.post('/api/status', requireDeviceKey, async (req, res) => {
     if (!s || !s.deviceId) return res.status(400).json({ error: 'deviceId required' });
     await upsertStatus(s);
     res.json({ ok: true });
+
+    // Non-blocking from the ESP32's point of view - response already sent.
+    analytics.updateFromStatus(s.deviceId, s).catch((err) => {
+      console.error('[ANALYTICS] updateFromStatus failed:', err);
+    });
   } catch (err) {
     console.error('[POST /api/status] error:', err);
     res.status(500).json({ error: 'internal_error' });
@@ -49,8 +101,21 @@ app.post('/api/events', requireDeviceKey, async (req, res) => {
     if (!e || !e.deviceId || !e.eventType) {
       return res.status(400).json({ error: 'deviceId and eventType required' });
     }
-    await insertEvent(e);
+    const eventId = await insertEvent(e);
     res.json({ ok: true });
+
+    // Everything below happens AFTER the ESP32 already has its 200 OK.
+    // The local alarm (buzzer/RGB/OLED) already fired before this event
+    // was even posted - nothing here is on that critical path.
+    analytics.updateFromEvent(e.deviceId, e).catch((err) => {
+      console.error('[ANALYTICS] updateFromEvent failed:', err);
+    });
+
+    if (NARRATIVE_EVENT_TYPES.has(e.eventType)) {
+      enrichEventWithNarrative(eventId, e, e.deviceId).catch((err) => {
+        console.error('[AI] enrichEventWithNarrative failed:', err);
+      });
+    }
   } catch (err) {
     console.error('[POST /api/events] error:', err);
     res.status(500).json({ error: 'internal_error' });
@@ -83,6 +148,36 @@ app.get('/api/events', async (req, res) => {
   }
 });
 
+// Single event lookup - useful for polling "did the AI summary show up
+// yet?" for one specific event without re-fetching the whole list.
+app.get('/api/events/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'invalid id' });
+    const event = await getEventById(id);
+    if (!event) return res.status(404).json({ error: 'not_found' });
+    res.json(event);
+  } catch (err) {
+    console.error('[GET /api/events/:id] error:', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// Layer 1 output, human-facing: servo health, MQ-2 baseline drift, RFID
+// reliability, connectivity, and rule-based notes. No AI involved in
+// producing this - it's what the AI (and the dashboard) reads FROM.
+app.get('/api/maintenance/:deviceId?', async (req, res) => {
+  try {
+    const deviceId = req.params.deviceId || req.query.deviceId || DEFAULT_DEVICE_ID;
+    const status = await getStatus(deviceId);
+    const summary = await analytics.buildMaintenanceSummary(deviceId, status);
+    res.json(summary);
+  } catch (err) {
+    console.error('[GET /api/maintenance] error:', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { question, deviceId } = req.body || {};
@@ -95,8 +190,9 @@ app.post('/api/ai/chat', async (req, res) => {
       getStatus(targetDevice),
       getEvents(targetDevice, 15),
     ]);
+    const maintenance = await analytics.buildMaintenanceSummary(targetDevice, status);
 
-    const answer = await chatWithSentinel({ question, status, events });
+    const answer = await chatWithSentinel({ question, status, events, maintenance });
     res.json({ answer });
   } catch (err) {
     console.error('[POST /api/ai/chat] error:', err);
